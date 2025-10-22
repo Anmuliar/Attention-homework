@@ -36,9 +36,9 @@ pip install -r requirements.txt
 python --stage [prefill/decode] --backends triton
 ```
 
-## Ninetoothed 测试
+## NineToothed测试
 
-使用以下命令测试 Ninetoothed 后端的基础结果。选择 `prefill` 或 `decode` 阶段，并指定使用的后端为 Ninetoothed：
+使用以下命令测试 NineToothed 后端的基础结果。选择 `prefill` 或 `decode` 阶段，并指定使用的后端为NineToothed：
 
 ```bash
 python --stage [prefill/decode] --backends ninetoothed
@@ -51,5 +51,5 @@ python --stage [prefill/decode] --backends ninetoothed
 * `--stage` 参数：指定执行阶段，可以是 `prefill` 或 `decode`，分别表示预填充阶段和解码阶段。
 * `--backends` 参数：选择使用的后端，支持 `cuda`、`triton` 和 `ninetoothed`选择多个可以同时进行测试。
 
-确保在执行之前已经正确配置并安装相应的后端（CUDA、Triton 或 Ninetoothed）,有任何问题请联系助教邮箱wcz24@mails.tsinghua.edu.cn。
+确保在执行之前已经正确配置并安装相应的后端（CUDA、Triton 或 NineToothed）,有任何问题请联系助教邮箱wcz24@mails.tsinghua.edu.cn。
 
