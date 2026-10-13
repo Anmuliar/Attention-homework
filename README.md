@@ -1,7 +1,8 @@
-# FlashAttention 作业框架
+# Attention Kernel 作业框架
 
 本仓库用于实现大模型推理中的 scaled dot-product attention kernel，分别覆盖
-prefill 和 decode 两个阶段。完整的作业目标、接口约定、评分标准和报告要求见
+prefill 和 decode 两个阶段。作业重点是熟悉 Triton/NineToothed 的 kernel 编程和
+性能分析；FlashAttention 是可选的优化方向。完整的接口约定、评分标准和报告要求见
 [`homeworkmd/homework.tex`](homeworkmd/homework.tex)。
 
 ## 安装依赖

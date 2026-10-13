@@ -20,7 +20,7 @@
 \renewcommand{\baselinestretch}{1.18}
 \hypersetup{hidelinks}
 
-\title{大模型计算：FlashAttention 内核实现}
+\title{大模型计算：Attention Kernel 实现}
 \author{课程作业 HW2}
 \date{\today}
 
@@ -35,31 +35,25 @@ $s$，其核心计算为
   O = \operatorname{softmax}(s QK^\mathsf{T})V,
   \qquad s=1/\sqrt{D},
 \end{equation}
-其中 $D$ 是每个 attention head 的维度。该公式看起来简单，但直接实现会产生
-$L\times S$ 的注意力分数和概率矩阵，带来很高的显存读写开销。FlashAttention
-通过分块计算和 online softmax，避免完整保存这些中间矩阵，从而在 GPU 上获得更
-好的性能\cite{dao2022flashattention,dao2023flashattention2}。
+其中 $D$ 是每个 attention head 的维度。本次作业的任务是把这个计算写成一个
+可以在 GPU 上运行的 kernel，并通过实验把它逐步优化。你会分别处理 prefill 和
+decode：前者一次处理一段序列，后者每次只处理一个新 token，同时读取已有的 KV
+cache。
 
-本作业要求你在课程代码仓库中实现一个可运行、数值正确且经过性能分析的
-scaled dot-product attention 内核。你将面对两个推理阶段：prefill 一次处理一段
-输入序列，decode 每次只处理一个新 token，但要读取已经保存的 KV cache。作业的
-重点是理解算法、GPU 内存层次、并行划分和数值稳定性之间的关系，而不是调用一个
-已经写好的 FlashAttention 库。
+这次作业的重点是熟悉 Triton 或 NineToothed 的编程模型、调试方法和性能分析方法。
+FlashAttention 是一种很有代表性的优化思路\cite{dao2022flashattention,dao2023flashattention2}，
+但不是本作业的硬性要求。你可以从直接的分块实现开始，也可以进一步尝试 online
+softmax、减少中间张量和优化 KV cache 访问；关键是把选择和测量结果讲清楚。
 
-\subsection{学习目标}
+\subsection{你需要完成什么}
 
-完成作业后，你应当能够：
+这次作业希望你：
 \begin{itemize}[leftmargin=2.5em]
-  \item 从数学定义实现 attention，并用独立的参考实现验证结果；
-  \item 为 prefill 和 decode 选择合适的 tile、线程和内存访问策略；
-  \item 使用 PyTorch、Triton 或 NineToothed 的调试和性能工具定位瓶颈；
-  \item 使用 Nsight Systems（nsys）、Nsight Compute（ncu）或等价工具解释性能结果；
-  \item 在报告中清楚说明一个优化为什么有效、什么时候会失效，以及如何复现实验。
+  \item 从数学定义出发写出正确的 attention kernel，并用参考实现检查结果；
+  \item 熟悉 Triton 或 NineToothed 中的 tile、线程和内存访问表达方式；
+  \item 了解 prefill 和 decode 的瓶颈为什么不同；
+  \item 使用 nsys、ncu 或等价工具定位问题，说明优化前后的变化。
 \end{itemize}
-
-目标读者是已经学习过 Python、PyTorch、CUDA 基本概念和矩阵乘法的计算机专业
-研究生一年级同学。作业不会逐行讲解 CUDA 或 Triton 语法，但给出了完整的接口、
-参考实现和最小运行入口。
 
 \section{代码仓库和允许的实现路径}
 
@@ -83,11 +77,11 @@ HONOR-CODE.md & 代码来源和讨论记录 \\
 \end{center}
 
 仓库中的正式包名是 \texttt{ninetoothed}，文档中将其称为 NineToothed（九齿）\cite{ninetoothed2026}。
-\texttt{torch} backend 是正确性和性能的参考基线；直接调用
+代码中的 \texttt{torch} backend 用来做正确性和性能基线；直接调用
 \verb|torch.nn.functional.scaled_dot_product_attention| 不能作为本作业的自定义
-kernel 提交。你可以使用它检查结果、建立性能上限和验证实验工具。计分实现路径为
-Triton、NineToothed，以及可选的 CUDA 路径；三种实现方式使用同一个数学接口。Triton
-的编程模型可参考其官方文档\cite{triton2024}。
+kernel 提交。你可以用它检查结果、估计性能上限和验证 benchmark。主要实现路径是
+Triton 和 NineToothed，CUDA C++ 路径作为额外选择；三种路径使用同一个数学接口。
+Triton 的编程模型可参考其官方文档\cite{triton2024}。
 
 \section{任务定义和接口}
 
@@ -144,12 +138,13 @@ scaled_dot_product_attention_decode(
 如果你希望探索 causal attention 或 GQA，请在报告中作为额外实验单独说明，并保证
 提交的默认函数仍然遵守上述接口。
 
-\section{必须完成的内容}
+\section{作业要求}
 
 \begin{enumerate}[leftmargin=2.5em]
   \item 实现 prefill kernel，并通过适配层返回正确的 $[B,H,L,D]$ 输出。
   \item 实现 decode kernel，正确读取分离的 KV cache，并通过适配层返回输出。
-  \item 为两个阶段分别进行性能优化。只实现其中一个阶段会失去另一个阶段的全部
+  \item 为两个阶段分别做至少一轮有依据的优化。优化不限定为 FlashAttention，
+        也不要求一定使用 online softmax；只实现其中一个阶段会失去另一个阶段的
         kernel 分数。
   \item 提交一份实验报告，解释算法、优化决策、正确性结果和性能数据。
 \end{enumerate}
@@ -159,13 +154,16 @@ PyTorch 的现成 attention 算子、FlashAttention、xFormers、FlashInfer 或�
 attention 库作为最终实现不计入 kernel 分数；它们可以作为参考基线，但必须在报告
 和 \texttt{HONOR-CODE.md} 中明确说明。
 
-\section{实现提示}
+\section{可选的优化方向}
+
+下面的内容是建议，不是额外的功能清单。先把接口和边界处理做好，再根据 profiling
+结果决定是否采用其中的思路。
 
 \subsection{Online softmax}
 
-FlashAttention 的关键是沿着 Key 的 tile 逐块更新 softmax，而不是保存完整的
-$L\times S$ 分数矩阵。对每个 Query 行维护最大值 $m$、归一化因子 $\ell$ 和部分
-输出 $o$。读入新的分数 tile 后，可使用如下递推：
+如果你想尝试 FlashAttention 风格的实现，可以沿着 Key 的 tile 逐块更新 softmax，
+避免保存完整的 $L\times S$ 分数矩阵。对每个 Query 行维护最大值 $m$、归一化因子
+$\ell$ 和部分输出 $o$。读入新的分数 tile 后，可使用如下递推：
 \begin{align}
   m_{\rm new} &= \max(m_{\rm old},\max_j s_j),\\
   \ell_{\rm new} &= \ell_{\rm old}e^{m_{\rm old}-m_{\rm new}}
@@ -173,7 +171,8 @@ $L\times S$ 分数矩阵。对每个 Query 行维护最大值 $m$、归一化因
   o_{\rm new} &= \frac{o_{\rm old}\ell_{\rm old}e^{m_{\rm old}-m_{\rm new}}
       +\sum_j e^{s_j-m_{\rm new}}v_j}{\ell_{\rm new}}.
 \end{align}
-初始状态应能处理全负无穷的 masked tile，最终输出不能包含 NaN 或 Inf。
+初始状态应能处理边界 tile，最终输出不能包含 NaN 或 Inf。直接 materialize 分数
+矩阵也可以作为第一版实现；报告中请比较两种方法的代价和收益。
 
 \subsection{Prefill 优化方向}
 
@@ -183,7 +182,7 @@ Prefill 的 $QK^\mathsf{T}$ 和 $PV$ 都具有较大的二维工作量。可以�
   \item 如何让 Q、K、V 的读取合并，并让重复使用的数据停留在 SRAM 或寄存器中；
   \item $BLOCK\_SIZE\_M$、$BLOCK\_SIZE\_N$、warp 数和 pipeline stages 如何影响
         occupancy、寄存器压力和内存事务；
-  \item 如何在不产生 $L\times S$ 中间张量的情况下完成稳定 softmax；
+  \item 是否值得避免 $L\times S$ 中间张量，以及这样做对寄存器和访存的影响；
   \item 如何处理 $L$、$D$ 不是 tile 大小整数倍的边界。
 \end{itemize}
 
@@ -198,7 +197,7 @@ Decode 的 Query 长度固定为 1，计算常常受 KV cache 读取和并行度
 \end{itemize}
 
 这些只是分析入口，不要求所有人使用同一种算法。报告应结合实际测量说明你的
-选择，而不是只罗列术语。
+选择，不需要为了使用某个术语而强行改写算法。
 
 \section{环境、运行和调试}
 
