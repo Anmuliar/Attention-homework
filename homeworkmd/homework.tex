@@ -1,0 +1,340 @@
+\documentclass[11pt]{article}
+
+% This document is compiled with XeLaTeX.  The source is intentionally kept
+% self-contained so that it can be distributed together with the code repo.
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{array}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{indentfirst}
+\usepackage{longtable}
+\usepackage{xcolor}
+\usepackage{xeCJK}
+
+\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.35\baselineskip}
+\renewcommand{\baselinestretch}{1.18}
+\hypersetup{hidelinks}
+
+\title{大模型计算：FlashAttention 内核实现}
+\author{课程作业 HW2}
+\date{\today}
+
+\begin{document}
+\maketitle
+
+\section{作业简介}
+
+Transformer 的自注意力以 Query、Key 和 Value 为输入\cite{vaswani2017attention}。给定缩放因子
+$s$，其核心计算为
+\begin{equation}
+  O = \operatorname{softmax}(s QK^\mathsf{T})V,
+  \qquad s=1/\sqrt{D},
+\end{equation}
+其中 $D$ 是每个 attention head 的维度。该公式看起来简单，但直接实现会产生
+$L\times S$ 的注意力分数和概率矩阵，带来很高的显存读写开销。FlashAttention
+通过分块计算和 online softmax，避免完整保存这些中间矩阵，从而在 GPU 上获得更
+好的性能\cite{dao2022flashattention,dao2023flashattention2}。
+
+本作业要求你在课程代码仓库中实现一个可运行、数值正确且经过性能分析的
+scaled dot-product attention 内核。你将面对两个推理阶段：prefill 一次处理一段
+输入序列，decode 每次只处理一个新 token，但要读取已经保存的 KV cache。作业的
+重点是理解算法、GPU 内存层次、并行划分和数值稳定性之间的关系，而不是调用一个
+已经写好的 FlashAttention 库。
+
+\subsection{学习目标}
+
+完成作业后，你应当能够：
+\begin{itemize}[leftmargin=2.5em]
+  \item 从数学定义实现 attention，并用独立的参考实现验证结果；
+  \item 为 prefill 和 decode 选择合适的 tile、线程和内存访问策略；
+  \item 使用 PyTorch、Triton 或 NineToothed 的调试和性能工具定位瓶颈；
+  \item 使用 Nsight Systems（nsys）、Nsight Compute（ncu）或等价工具解释性能结果；
+  \item 在报告中清楚说明一个优化为什么有效、什么时候会失效，以及如何复现实验。
+\end{itemize}
+
+目标读者是已经学习过 Python、PyTorch、CUDA 基本概念和矩阵乘法的计算机专业
+研究生一年级同学。作业不会逐行讲解 CUDA 或 Triton 语法，但给出了完整的接口、
+参考实现和最小运行入口。
+
+\section{代码仓库和允许的实现路径}
+
+请从课程提供的仓库开始工作。主要文件如下：
+
+\begin{center}
+\begin{tabular}{>{\ttfamily}p{0.43\textwidth} p{0.47\textwidth}}
+\toprule
+文件或目录 & 用途 \\
+\midrule
+main.py & 统一的正确性检查和简单 benchmark 入口 \\
+ops/base/impl.py & 清晰但低效的数学参考实现 \\
+ops/triton/torch.py & Triton 实现的 Python 适配层 \\
+ops/triton/kernels/ & Triton prefill/decode kernel 的待实现文件 \\
+ops/ninetoothed/torch.py & NineToothed 实现的 Python 适配层 \\
+ops/ninetoothed/kernels/ & NineToothed kernel 的待实现文件 \\
+ops/cuda/kernels/ & 可选的 CUDA C++/CUDA 实现路径 \\
+HONOR-CODE.md & 代码来源和讨论记录 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+仓库中的正式包名是 \texttt{ninetoothed}，文档中将其称为 NineToothed（九齿）\cite{ninetoothed2026}。
+\texttt{torch} backend 是正确性和性能的参考基线；直接调用
+\verb|torch.nn.functional.scaled_dot_product_attention| 不能作为本作业的自定义
+kernel 提交。你可以使用它检查结果、建立性能上限和验证实验工具。计分实现路径为
+Triton、NineToothed，以及可选的 CUDA 路径；三种实现方式使用同一个数学接口。Triton
+的编程模型可参考其官方文档\cite{triton2024}。
+
+\section{任务定义和接口}
+
+\subsection{Prefill}
+
+Prefill 阶段输入完整的 Query、Key、Value：
+\begin{itemize}[leftmargin=2.5em]
+  \item $Q,K,V$ 的形状均为 $[B,H,L,D]$；
+  \item 输出 $O$ 的形状为 $[B,H,L,D]$；
+  \item 默认缩放因子为 $1/\sqrt{D}$，调用者也可能显式传入 \texttt{scale}；
+  \item 测试数据为 CUDA 上的连续 tensor，通常使用 \texttt{float16}；实现可以在
+        float32 中累加以提高数值稳定性。
+\end{itemize}
+
+Python 适配层的函数签名为：
+\begin{verbatim}
+scaled_dot_product_attention_prefill(q, k, v, scale=None) -> o
+\end{verbatim}
+
+\subsection{Decode 和 KV cache}
+
+Decode 阶段只计算一个新 token。输入形状为：
+\begin{itemize}[leftmargin=2.5em]
+  \item $Q\in\mathbb{R}^{B\times H\times 1\times D}$；
+  \item 新 token 的 $K,V\in\mathbb{R}^{B\times H\times 1\times D}$；
+  \item 历史缓存 $K_{\rm past},V_{\rm past}\in\mathbb{R}^{B\times H\times T\times D}$；
+  \item 输出 $O\in\mathbb{R}^{B\times H\times 1\times D}$。
+\end{itemize}
+
+逻辑上，decode 使用
+\begin{equation}
+  K_{\rm all}=\operatorname{cat}(K_{\rm past},K,\text{dim}=-2),\qquad
+  V_{\rm all}=\operatorname{cat}(V_{\rm past},V,\text{dim}=-2),
+\end{equation}
+再计算 $\operatorname{softmax}(sQK_{\rm all}^{\mathsf T})V_{\rm all}$。为了避免不
+必要的复制，作业接口把历史 cache 和新 token 分开传入；kernel 内部不得为了方便
+而无条件构造完整的拼接张量。
+
+函数签名为：
+\begin{verbatim}
+scaled_dot_product_attention_decode(
+    q, k, v, past_k, past_v, scale=None
+) -> o
+\end{verbatim}
+
+\subsection{统一约定}
+
+本仓库当前的评测是无 mask、无 dropout、非 causal 的 scaled dot-product attention。
+不要自行添加 causal mask、padding mask、dropout、GQA/MQA head 重排或 RoPE；这些
+逻辑不属于本次 kernel 的接口。$B,H,D$ 在同一次调用的各个 tensor 之间一致，长度
+可能不是 tile 大小的整数倍，因此边界必须用 mask 正确处理。不得修改输入 tensor，
+也不得依赖固定的 $B,H,L,T,D$ 才能得到正确结果。
+
+如果你希望探索 causal attention 或 GQA，请在报告中作为额外实验单独说明，并保证
+提交的默认函数仍然遵守上述接口。
+
+\section{必须完成的内容}
+
+\begin{enumerate}[leftmargin=2.5em]
+  \item 实现 prefill kernel，并通过适配层返回正确的 $[B,H,L,D]$ 输出。
+  \item 实现 decode kernel，正确读取分离的 KV cache，并通过适配层返回输出。
+  \item 为两个阶段分别进行性能优化。只实现其中一个阶段会失去另一个阶段的全部
+        kernel 分数。
+  \item 提交一份实验报告，解释算法、优化决策、正确性结果和性能数据。
+\end{enumerate}
+
+你可以选择一种实现路径完成两个阶段，也可以组合不同路径进行实验。直接使用
+PyTorch 的现成 attention 算子、FlashAttention、xFormers、FlashInfer 或其他预编译
+attention 库作为最终实现不计入 kernel 分数；它们可以作为参考基线，但必须在报告
+和 \texttt{HONOR-CODE.md} 中明确说明。
+
+\section{实现提示}
+
+\subsection{Online softmax}
+
+FlashAttention 的关键是沿着 Key 的 tile 逐块更新 softmax，而不是保存完整的
+$L\times S$ 分数矩阵。对每个 Query 行维护最大值 $m$、归一化因子 $\ell$ 和部分
+输出 $o$。读入新的分数 tile 后，可使用如下递推：
+\begin{align}
+  m_{\rm new} &= \max(m_{\rm old},\max_j s_j),\\
+  \ell_{\rm new} &= \ell_{\rm old}e^{m_{\rm old}-m_{\rm new}}
+      +\sum_j e^{s_j-m_{\rm new}},\\
+  o_{\rm new} &= \frac{o_{\rm old}\ell_{\rm old}e^{m_{\rm old}-m_{\rm new}}
+      +\sum_j e^{s_j-m_{\rm new}}v_j}{\ell_{\rm new}}.
+\end{align}
+初始状态应能处理全负无穷的 masked tile，最终输出不能包含 NaN 或 Inf。
+
+\subsection{Prefill 优化方向}
+
+Prefill 的 $QK^\mathsf{T}$ 和 $PV$ 都具有较大的二维工作量。可以从以下问题开始
+分析：
+\begin{itemize}[leftmargin=2.5em]
+  \item 如何让 Q、K、V 的读取合并，并让重复使用的数据停留在 SRAM 或寄存器中；
+  \item $BLOCK\_SIZE\_M$、$BLOCK\_SIZE\_N$、warp 数和 pipeline stages 如何影响
+        occupancy、寄存器压力和内存事务；
+  \item 如何在不产生 $L\times S$ 中间张量的情况下完成稳定 softmax；
+  \item 如何处理 $L$、$D$ 不是 tile 大小整数倍的边界。
+\end{itemize}
+
+\subsection{Decode 优化方向}
+
+Decode 的 Query 长度固定为 1，计算常常受 KV cache 读取和并行度限制。可以分析：
+\begin{itemize}[leftmargin=2.5em]
+  \item 一个 program 是否能隐藏 KV cache 的访存延迟；
+  \item 是否需要沿 Key 长度切分，再对多个 partial result 做归约；
+  \item 如何让相邻线程访问连续的 head dimension，并控制中间状态的大小；
+  \item $T$ 较短和较长时是否应采用不同的配置。
+\end{itemize}
+
+这些只是分析入口，不要求所有人使用同一种算法。报告应结合实际测量说明你的
+选择，而不是只罗列术语。
+
+\section{环境、运行和调试}
+
+在课程提供的容器中安装依赖：
+\begin{verbatim}
+pip install -r requirements.txt
+\end{verbatim}
+
+当前依赖固定为 Torch 2.13.0 和 NineToothed 0.26.0。建议使用 CUDA 13.0 的
+PyTorch wheel；如果课程容器已经提供匹配的 Torch/CUDA，则以容器为准。运行时先
+确认：
+\begin{verbatim}
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
+\end{verbatim}
+
+\subsection{正确性和本地 benchmark}
+
+下面的命令分别运行两个阶段的参考基线。\texttt{torch} 只用于检查环境和建立
+基线：
+\begin{verbatim}
+python main.py --stage prefill --backends torch
+python main.py --stage decode  --backends torch
+\end{verbatim}
+
+完成 Triton 或 NineToothed 后，可运行：
+\begin{verbatim}
+python main.py --stage prefill --backends torch triton
+python main.py --stage decode  --backends torch triton
+python main.py --stage prefill --backends torch ninetoothed
+python main.py --stage decode  --backends torch ninetoothed
+\end{verbatim}
+
+这些命令用于快速发现 shape、边界和数值错误。正式评分会使用多组隐藏输入，
+不应只针对仓库中默认的一个长度或一个 tile 配置优化。首次运行 Triton 或
+NineToothed 时会包含编译和 autotune 开销；报告中的稳态性能必须在预热之后测量。
+
+\subsection{CUDA 路径（可选）}
+
+如果选择 CUDA C++，进入 \texttt{ops/cuda/kernels} 编译扩展：
+\begin{verbatim}
+cd ops/cuda/kernels
+TORCH_CUDA_ARCH_LIST=8.9 python setup.py build_ext --inplace
+cd ../..
+python main.py --stage prefill --backends cuda
+\end{verbatim}
+
+课程的 RTX 4090 对应 compute capability 8.9。其他 GPU 应设置相应的
+\texttt{TORCH\_CUDA\_ARCH\_LIST}；不要把某一台机器的架构值硬编码到提交中。
+Triton、NineToothed 和 Torch 路径不需要编译这个扩展，框架会在未安装扩展时给出
+明确提示。
+
+\section{正确性要求}
+
+正确性检查应至少覆盖以下情况：
+\begin{itemize}[leftmargin=2.5em]
+  \item $B\in\{1,2,4\}$、$H\in\{1,8,32\}$、$D\in\{32,64,128\}$；
+  \item prefill 的 $L$ 和 decode 的 $T$ 同时覆盖很短、非 tile 整数倍和较长输入；
+  \item $\texttt{scale=None}$ 以及显式传入一个 scale；
+  \item float16 输入下的有限值、相对误差和绝对误差；
+  \item 多次运行结果稳定，且不会修改输入或产生越界访问。
+\end{itemize}
+
+参考实现可以使用 \texttt{ops/base/impl.py} 和
+\texttt{torch.nn.functional.scaled_dot_product_attention}\cite{pytorchsdpa} 交叉检查。由于不同
+实现的归约顺序不同，不能要求逐元素 bitwise 相等。报告必须给出测试 shape、最大
+绝对误差、最大相对误差和采用的容差，并解释任何失败样例。
+
+\section{性能测量和报告}
+
+报告至少包含以下内容：
+\begin{enumerate}[leftmargin=2.5em]
+  \item kernel 的算法流程和线程/块映射图；
+  \item online softmax、边界 mask、累加精度和 KV cache 读取方式；
+  \item 至少三组 prefill 和三组 decode 的稳态延迟，包含输入 shape、dtype、GPU、
+        warmup 次数和重复次数；
+  \item 与 Torch 参考基线的延迟、加速比，以及能提供时的 TFLOP/s 和有效内存带宽；
+  \item 使用 nsys、ncu 或等价工具得到的证据，例如 kernel 时间线、occupancy、
+        DRAM throughput、寄存器或 shared-memory 使用量；
+  \item 一个失败或收益不明显的优化尝试，并说明原因；
+  \item 其他同学可以复现实验的完整命令。
+\end{enumerate}
+
+对于 batch size $B$、head 数 $H$、Query 长度 $L$、Key 长度 $S$ 和 head dimension
+$D$，可用约 $4BH LSD$ 次浮点运算粗略估算 attention 的 FLOPs（一次 $QK^\mathsf{T}$
+和一次 $PV$）。若测得 kernel 时间为 $t$ 毫秒，则
+\begin{equation}
+  \operatorname{TFLOP/s}\approx\frac{4BH LSD}{t\times10^9}.
+\end{equation}
+该估算用于横向比较，不替代对实际指令和访存的分析。编译、首次 autotune、模型
+加载和 Python 打印时间不得混入稳态 kernel 延迟。
+
+\section{评分标准}
+
+总分为 100 分：
+\begin{center}
+\begin{tabular}{p{0.48\textwidth} c p{0.34\textwidth}}
+\toprule
+部分 & 分值 & 评分要点 \\
+\midrule
+Prefill kernel & 40 & 正确性/API 28 分；性能、代码质量和分析 12 分 \\
+Decode kernel & 40 & 正确性/API 28 分；性能、代码质量和分析 12 分 \\
+实验报告 & 20 & 算法说明、测量方法、性能证据和局限性 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+每个阶段的性能分在通过正确性门槛后才有效；只返回固定值、调用现成 attention
+库、依赖特定测试输入或在边界输入上越界的实现不能获得该阶段的正确性分。性能分
+在所有通过正确性门槛的提交之间统一比较，不因使用 CUDA、Triton 或 NineToothed
+而预先设置不同的排名标准。自动调优必须在每个测试 case 的 15 分钟限制内结束；
+超时的 case 不计该 case 的性能分。
+
+\section{提交内容和学术规范}
+
+提交目录命名为“学号\_Attention\_姓名”，例如
+\texttt{2025310000\_Attention\_张三}。目录至少包含：
+\begin{itemize}[leftmargin=2.5em]
+  \item 修改后的 kernel、适配层和必要的配置文件；
+  \item 一份 PDF 或 LaTeX 源码形式的性能分析报告；
+  \item \texttt{HONOR-CODE.md}，列出使用过的公开代码、文档、生成式工具和讨论过
+        的同学，并说明它们如何影响提交；
+  \item 一份简短的复现说明，包括环境、编译命令、测试命令和已知限制。
+\end{itemize}
+
+禁止提交编译产物、模型权重、与作业无关的大文件或依赖本机绝对路径的脚本。允许
+讨论思路和阅读公开资料，但实现、调参和报告必须独立完成。抄袭、隐瞒外部代码
+来源或伪造性能数据将按课程学术规范处理。具体要求见
+\href{https://lab.cs.tsinghua.edu.cn/rust/plagiarism/}{课程学术规范页面}。
+
+\section{参考资料}
+
+建议先阅读注意力的原始定义，再阅读 FlashAttention 和 FlashAttention-2 对分块
+计算、I/O 感知和并行划分的讨论。Triton 和 NineToothed 的官方文档可用于查阅
+语言语义和编程接口；它们不是可以直接复制到提交中的答案。
+
+\bibliographystyle{plain}
+\bibliography{ref}
+
+\end{document}

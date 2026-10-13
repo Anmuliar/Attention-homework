@@ -10,7 +10,12 @@ import argparse
 import ops.ninetoothed.torch
 import ops.triton.torch
 import ops.base.impl
-import cuda_attention
+
+try:
+    import cuda_attention
+except ImportError:
+    # The CUDA extension is optional for the Triton/NineToothed/Torch paths.
+    cuda_attention = None
 
 parser = argparse.ArgumentParser(description="Run attention test with different backends and stages.")
 
@@ -125,6 +130,11 @@ def scaled_dot_product_attention_backend(backend_name, stage = args.stage):
         elif stage == "prefill":
             impl = F.scaled_dot_product_attention
     elif backend_name == "cuda":
+        if cuda_attention is None:
+            raise RuntimeError(
+                "The CUDA backend is not built. Install it from ops/cuda/kernels "
+                "or choose triton, ninetoothed, or torch."
+            )
         if stage == "decode":
             impl = cuda_attention.scaled_dot_product_attention_decode
         elif stage == "prefill":
@@ -213,6 +223,10 @@ if __name__ == "__main__":
             print("❌ Ninetoothed and benchmark differ.")
     
     if "cuda" in args.backends:
+        if cuda_attention is None:
+            raise RuntimeError(
+                "The CUDA backend is not built; run the CUDA extension setup first."
+            )
         if args.stage == "prefill":
             cuda_attention.scaled_dot_product_attention_prefill(*inputs, output=o)
         if args.stage == "decode":
@@ -248,6 +262,7 @@ if __name__ == "__main__":
                     lambda: F.scaled_dot_product_attention(*inputs)
                 )
             if args.stage == "decode":
+                q, k, v, past_k, past_v = inputs
                 k_new = torch.cat([past_k, k], dim=-2)
                 v_new = torch.cat([past_v, v], dim=-2)
                 ms = triton.testing.do_bench(
@@ -263,13 +278,21 @@ if __name__ == "__main__":
                     lambda: ops.triton.torch.scaled_dot_product_attention_decode(*inputs)
                 )
         elif provider == "cuda":
+            if cuda_attention is None:
+                raise RuntimeError(
+                    "The CUDA backend is not built; run the CUDA extension setup first."
+                )
             if args.stage == "prefill":
                 ms = triton.testing.do_bench(
-                    lambda: cuda_attention.scaled_dot_product_attention_prefill(*inputs, output)
+                    lambda: cuda_attention.scaled_dot_product_attention_prefill(
+                        *inputs, output=o
+                    )
                 )
             if args.stage == "decode":
                 ms = triton.testing.do_bench(
-                    lambda: cuda_attention.scaled_dot_product_attention_decode(*inputs, output)
+                    lambda: cuda_attention.scaled_dot_product_attention_decode(
+                        *inputs, output=o
+                    )
                 )
         elif provider == "benchmark":
             if args.stage == "prefill":

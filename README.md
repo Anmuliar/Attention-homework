@@ -1,55 +1,54 @@
+# FlashAttention 作业框架
 
-# 项目使用说明
+本仓库用于实现大模型推理中的 scaled dot-product attention kernel，分别覆盖
+prefill 和 decode 两个阶段。完整的作业目标、接口约定、评分标准和报告要求见
+[`homeworkmd/homework.tex`](homeworkmd/homework.tex)。
 
 ## 安装依赖
 
-首先，安装所需的依赖项：
+请在课程提供的 CUDA 容器中执行：
 
 ```bash
 pip install -r requirements.txt
 ```
 
-推荐使用cuda12.8+torch2.9
-
-## CUDA 测试
-
-完成 CUDA kernel 编写后，请按照以下步骤安装并测试 CUDA 版本的实现：
-
-1. 进入 `/ops/cuda/kernels` 目录并运行以下命令来安装 kernel：
-
-   ```bash
-   python setup.py install
-   ```
-    在其他架构上进行实验需要修改os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"为其他值。
-
-2. 使用以下命令运行测试，选择 `prefill` 或 `decode` 阶段，并指定使用的后端为 CUDA：
-
-   ```bash
-   python --stage [prefill/decode] --backends cuda
-   ```
-
-## Triton 测试
-
-使用以下命令测试 Triton 后端的基础结果。选择 `prefill` 或 `decode` 阶段，并指定使用的后端为 Triton：
+当前作业依赖固定为 Torch 2.13.0、NineToothed 0.26.0，并使用与之匹配的 Triton
+版本。请先确认 CUDA 可用：
 
 ```bash
-python --stage [prefill/decode] --backends triton
+python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
 ```
 
-## NineToothed测试
+## 快速运行
 
-使用以下命令测试 NineToothed 后端的基础结果。选择 `prefill` 或 `decode` 阶段，并指定使用的后端为NineToothed：
+`torch` backend 是参考基线，不能直接作为自定义 kernel 提交：
 
 ```bash
-python --stage [prefill/decode] --backends ninetoothed
+python main.py --stage prefill --backends torch
+python main.py --stage decode  --backends torch
 ```
 
----
+实现 Triton 或 NineToothed 后，可以与 Torch 基线一起检查：
 
-### 说明：
+```bash
+python main.py --stage prefill --backends torch triton
+python main.py --stage decode  --backends torch triton
+python main.py --stage prefill --backends torch ninetoothed
+python main.py --stage decode  --backends torch ninetoothed
+```
 
-* `--stage` 参数：指定执行阶段，可以是 `prefill` 或 `decode`，分别表示预填充阶段和解码阶段。
-* `--backends` 参数：选择使用的后端，支持 `cuda`、`triton` 和 `ninetoothed`选择多个可以同时进行测试。
+首次运行会包含编译和 autotune 时间；性能报告应只统计预热后的稳态 kernel 延迟。
 
-确保在执行之前已经正确配置并安装相应的后端（CUDA、Triton 或 NineToothed）,有任何问题请联系助教邮箱wcz24@mails.tsinghua.edu.cn。
+## 可选 CUDA 路径
 
+如果选择 CUDA C++，RTX 4090 使用 compute capability 8.9：
+
+```bash
+cd ops/cuda/kernels
+TORCH_CUDA_ARCH_LIST=8.9 python setup.py build_ext --inplace
+cd ../..
+python main.py --stage prefill --backends cuda
+```
+
+Triton、NineToothed 和 Torch 路径不要求先编译 CUDA 扩展。提交前请阅读
+[`HONOR-CODE.md`](HONOR-CODE.md)，如使用公开资料或工具，请按作业文档记录来源。

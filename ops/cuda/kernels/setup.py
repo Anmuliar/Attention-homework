@@ -3,7 +3,10 @@ from torch.utils.cpp_extension import BuildExtension, CUDAExtension
 import os
 import torch
 
-os.environ["TORCH_CUDA_ARCH_LIST"] = "9.0"
+# The course benchmark uses RTX 4090 (compute capability 8.9).  Override this
+# from the shell when compiling for another GPU, for example:
+# TORCH_CUDA_ARCH_LIST=9.0 python setup.py build_ext --inplace
+os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.9")
 
 torch_lib_path = os.path.join(os.path.dirname(torch.__file__), "lib")
 print(torch_lib_path)
