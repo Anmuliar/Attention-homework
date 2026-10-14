@@ -14,10 +14,10 @@
 \usepackage{indentfirst}
 \usepackage{shorttoc}
 \usepackage{enumitem}
-\usepackage{hyperref}
 \usepackage{clrscode}
 \usepackage{xcolor}
 \usepackage{listings}
+\usepackage{hyperref}
 
 \lstdefinestyle{interface}{
   basicstyle=\small\ttfamily,
@@ -32,7 +32,12 @@
   showstringspaces=false
 }
 
-\hypersetup{hidelinks}
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  citecolor=blue!60!black,
+  urlcolor=blue!60!black
+}
 \setlength{\parindent}{2em}
 \setlength{\parskip}{0.2\baselineskip}
 \renewcommand{\baselinestretch}{1.2}
@@ -279,7 +284,7 @@ PyTorch 的 scaled dot-product attention 文档可以用来核对函数语义和
 注明来源和具体使用方式；不得直接将现成的 Attention kernel 作为本作业结果。
 
 
-\bibliographystyle{plain}  % Choose your preferred bibliography style
+\bibliographystyle{plain}
 \bibliography{ref}
 
 \end{document}
