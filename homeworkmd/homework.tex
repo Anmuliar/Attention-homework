@@ -17,6 +17,18 @@
 \usepackage{hyperref}
 \usepackage{clrscode}
 \usepackage{xcolor}
+\usepackage{listings}
+
+\lstdefinestyle{interface}{
+  basicstyle=\small\ttfamily,
+  backgroundcolor=\color{gray!5},
+  frame=single,
+  rulecolor=\color{gray!30},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  showstringspaces=false
+}
 
 \hypersetup{hidelinks}
 \setlength{\parindent}{2em}
@@ -81,9 +93,9 @@ Prefill 阶段输入完整的 Query、Key、Value：
 \end{itemize}
 
 Python 适配层的函数名为：
-\begin{verbatim}
+\begin{lstlisting}[style=interface]
 scaled_dot_product_attention_prefill(q, k, v, scale=None) -> o
-\end{verbatim}
+\end{lstlisting}
 
 \textbf{DECODE 和 KV Cache}
 
@@ -103,11 +115,11 @@ Decode 阶段只计算一个新 token。输入形状为：
 再计算 $\operatorname{softmax}(sQK_{\rm all}^{\mathsf T})V_{\rm all}$。作业接口把历史 cache 和新 token 分开传入。
 
 函数名为：
-\begin{verbatim}
+\begin{lstlisting}[style=interface]
 scaled_dot_product_attention_decode(
     q, k, v, past_k, past_v, scale=None
 ) -> o
-\end{verbatim}
+\end{lstlisting}
 
 
 \subsubsection{统一约定和正确性检验}
