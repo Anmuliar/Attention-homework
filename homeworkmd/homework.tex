@@ -1,107 +1,91 @@
-\documentclass[11pt]{article}
+% Problem Template
+% By frank_c1
+% Version 1.0 - Last Update at 2016/02/01
+% Copyright (c) 2016 All rights reserved.
 
-% This document is compiled with XeLaTeX.  The source is intentionally kept
-% self-contained so that it can be distributed together with the code repo.
-\usepackage{amsmath}
-\usepackage{amssymb}
+\documentclass{article}
+
 \usepackage{array}
-\usepackage{booktabs}
-\usepackage{enumitem}
-\usepackage{geometry}
-\usepackage{hyperref}
-\usepackage{indentfirst}
-\usepackage{longtable}
-\usepackage{xcolor}
+\usepackage{ulem}
 \usepackage{xeCJK}
+\usepackage{graphicx}
+\usepackage{amsmath}
+\usepackage{geometry}
+\usepackage{indentfirst}
+\usepackage{shorttoc}
+\usepackage{enumitem}
+\usepackage{hyperref}
+\usepackage{clrscode}
+\usepackage{xcolor}
 
-\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
-\setlength{\parindent}{2em}
-\setlength{\parskip}{0.35\baselineskip}
-\renewcommand{\baselinestretch}{1.18}
 \hypersetup{hidelinks}
-
-\title{大模型计算：Attention Kernel 实现}
-\author{课程作业 HW2}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.2\baselineskip}
+\renewcommand{\baselinestretch}{1.2}
+\geometry{left=2.5cm,right=2.5cm,top=2.5cm,bottom=2.5cm}
+\title{大模型计算-HW2}
 \date{\today}
 
 \begin{document}
+\newgeometry{top=5cm}
 \maketitle
 
-\section{作业简介}
+\section{作业背景}
+Attention 机制最初由 Google Brain 团队在 2017 年发表的论文《Attention Is All You Need》中提出\cite{vaswani2017attention}，旨在解决序列模型（如 RNN）在处理长序列时遇到的困难。该机制使模型能够动态关注输入序列的不同部分，从而提升机器翻译和文本生成等任务的性能。
 
-Transformer 的自注意力以 Query、Key 和 Value 为输入\cite{vaswani2017attention}。给定缩放因子
-$s$，其核心计算为
+Attention 使用查询（Query）、键（Key）和值（Value）进行计算：先计算 Query 和 Key 的点积并进行缩放，再对每一行应用 Softmax 得到权重，最后对 Value 加权求和。
+
+\section{作业描述}
+\subsection{作业目标}
+通过本作业，你将熟悉用于设计 GPU 算子的编程语言，掌握算子优化的基本方法，并结合 GPU 体系结构进行初步的性能优化。在完成两个阶段的 Attention kernel 后，你还需要通过性能分析理解不同计算特征下的优化策略。
+
+\subsection{作业要求}
+代码须独立完成，可以讨论思路，但严禁抄袭，并需要签署 Honor Code（详见附件）。
+
+提交文件夹命名格式为“学号\_Attention\_姓名”，例如：2025310000\_Attention\_张三。
+
+评测将在 RTX 4090 GPU 上进行，运行环境以课程提供的推荐容器为准。请确保代码能够在该环境中正常运行。
+
+请注意提交截止日期，具体时间以网络学堂公布为准。
+
+禁止直接使用现成的 Attention 算子库作为最终结果。实现语言可以选择 CUDA、Triton 或 NineToothed（九齿）。三种语言的工作量和最终性能可能不同，请根据自身情况选择。CUDA 提供底层控制，适合进行深度优化；Triton 简化了 GPU kernel 的编写，便于快速原型开发；NineToothed 在 Triton 之上提供了更高层次的抽象。
+
+\subsection{作业任务：大模型推理中的Attention算子}
+\subsubsection{任务描述}
+Attention 的计算公式为：
+
 \begin{equation}
-  O = \operatorname{softmax}(s QK^\mathsf{T})V,
-  \qquad s=1/\sqrt{D},
+\text{Attention}(Q, K, V) = \text{softmax}\left(\frac{QK^T}{\sqrt{d_k}}\right) V
 \end{equation}
-其中 $D$ 是每个 attention head 的维度。本次作业的任务是把这个计算写成一个
-可以在 GPU 上运行的 kernel，并通过实验把它逐步优化。你会分别处理 prefill 和
-decode：前者一次处理一段序列，后者每次只处理一个新 token，同时读取已有的 KV
-cache。
+其中 $Q$、$K$、$V$ 为稠密矩阵或张量。Softmax 将每一行的分数转换为概率分布。对于向量 \( x = [x_1, \dots, x_n] \)，
+\begin{equation}
+\text{softmax}(x_i) = \frac{e^{x_i}}{\sum_{j=1}^n e^{x_j}}
+\end{equation}
 
-这次作业的重点是熟悉 Triton 或 NineToothed 的编程模型、调试方法和性能分析方法。
-FlashAttention 是一种很有代表性的优化思路\cite{dao2022flashattention,dao2023flashattention2}，
-但不是本作业的硬性要求。你可以从直接的分块实现开始，也可以进一步尝试 online
-softmax、减少中间张量和优化 KV cache 访问；关键是把选择和测量结果讲清楚。
+在大模型推理中，prefill 阶段和 decode 阶段的 Attention 存在差异：prefill 阶段处理完整输入序列，主要计算矩阵乘法（GEMM）；decode 阶段逐 token 生成，利用 KV cache（Key-Value cache，即预先保存的 Key 和 Value）避免重复计算历史 token，其中矩阵乘法退化为向量-矩阵乘法（GEMV）。在本作业的 decode 接口中，你不需要管理 KV cache；历史 cache 会由调用方生成并作为参数传入。在实际推理引擎中，cache 的分配、更新和布局也需要额外管理。
 
-\subsection{你需要完成什么}
+基本实现以及标准的输入输出接口可参考作业代码仓库的ops/base/impl.py部分。
 
-这次作业希望你：
-\begin{itemize}[leftmargin=2.5em]
-  \item 从数学定义出发写出正确的 attention kernel，并用参考实现检查结果；
-  \item 熟悉 Triton 或 NineToothed 中的 tile、线程和内存访问表达方式；
-  \item 了解 prefill 和 decode 的瓶颈为什么不同；
-  \item 使用 nsys、ncu 或等价工具定位问题，说明优化前后的变化。
-\end{itemize}
+本作业要求在单 GPU 节点上分别实现并优化 prefill 阶段和 decode 阶段的 Attention，占课程总成绩的 12\%。
 
-\section{代码仓库和允许的实现路径}
+\subsubsection{任务定义和接口}
 
-请从课程提供的仓库开始工作。主要文件如下：
-
-\begin{center}
-\begin{tabular}{>{\ttfamily}p{0.43\textwidth} p{0.47\textwidth}}
-\toprule
-文件或目录 & 用途 \\
-\midrule
-main.py & 统一的正确性检查和简单 benchmark 入口 \\
-ops/base/impl.py & 清晰但低效的数学参考实现 \\
-ops/triton/torch.py & Triton 实现的 Python 适配层 \\
-ops/triton/kernels/ & Triton prefill/decode kernel 的待实现文件 \\
-ops/ninetoothed/torch.py & NineToothed 实现的 Python 适配层 \\
-ops/ninetoothed/kernels/ & NineToothed kernel 的待实现文件 \\
-ops/cuda/kernels/ & 可选的 CUDA C++/CUDA 实现路径 \\
-HONOR-CODE.md & 代码来源和讨论记录 \\
-\bottomrule
-\end{tabular}
-\end{center}
-
-仓库中的正式包名是 \texttt{ninetoothed}，文档中将其称为 NineToothed（九齿）\cite{ninetoothed2026}。
-代码中的 \texttt{torch} backend 用来做正确性和性能基线；直接调用
-\verb|torch.nn.functional.scaled_dot_product_attention| 不能作为本作业的自定义
-kernel 提交。你可以用它检查结果、估计性能上限和验证 benchmark。主要实现路径是
-Triton 和 NineToothed，CUDA C++ 路径作为额外选择；三种路径使用同一个数学接口。
-Triton 的编程模型可参考其官方文档\cite{triton2024}。
-
-\section{任务定义和接口}
-
-\subsection{Prefill}
+\textbf{PREFILL}
 
 Prefill 阶段输入完整的 Query、Key、Value：
 \begin{itemize}[leftmargin=2.5em]
   \item $Q,K,V$ 的形状均为 $[B,H,L,D]$；
   \item 输出 $O$ 的形状为 $[B,H,L,D]$；
-  \item 默认缩放因子为 $1/\sqrt{D}$，调用者也可能显式传入 \texttt{scale}；
   \item 测试数据为 CUDA 上的连续 tensor，通常使用 \texttt{float16}；实现可以在
         float32 中累加以提高数值稳定性。
 \end{itemize}
 
-Python 适配层的函数签名为：
+Python 适配层的函数名为：
 \begin{verbatim}
 scaled_dot_product_attention_prefill(q, k, v, scale=None) -> o
 \end{verbatim}
 
-\subsection{Decode 和 KV cache}
+\textbf{DECODE 和 KV Cache}
 
 Decode 阶段只计算一个新 token。输入形状为：
 \begin{itemize}[leftmargin=2.5em]
@@ -116,72 +100,134 @@ Decode 阶段只计算一个新 token。输入形状为：
   K_{\rm all}=\operatorname{cat}(K_{\rm past},K,\text{dim}=-2),\qquad
   V_{\rm all}=\operatorname{cat}(V_{\rm past},V,\text{dim}=-2),
 \end{equation}
-再计算 $\operatorname{softmax}(sQK_{\rm all}^{\mathsf T})V_{\rm all}$。为了避免不
-必要的复制，作业接口把历史 cache 和新 token 分开传入；kernel 内部不得为了方便
-而无条件构造完整的拼接张量。
+再计算 $\operatorname{softmax}(sQK_{\rm all}^{\mathsf T})V_{\rm all}$。作业接口把历史 cache 和新 token 分开传入。
 
-函数签名为：
+函数名为：
 \begin{verbatim}
 scaled_dot_product_attention_decode(
     q, k, v, past_k, past_v, scale=None
 ) -> o
 \end{verbatim}
 
-\subsection{统一约定}
 
-本仓库当前的评测是无 mask、无 dropout、非 causal 的 scaled dot-product attention。
-不要自行添加 causal mask、padding mask、dropout、GQA/MQA head 重排或 RoPE；这些
-逻辑不属于本次 kernel 的接口。$B,H,D$ 在同一次调用的各个 tensor 之间一致，长度
+\subsubsection{统一约定和正确性检验}
+
+仓库评测的是无 mask、无 dropout、非 causal 的 scaled dot-product attention。不需要自行添加 causal mask、padding mask、dropout、GQA/MQA head 重排或 RoPE；这些
+逻辑不属于本次 kernel 的接口。$B$、$H$、$D$ 在同一次调用的各个 tensor 之间一致，长度
 可能不是 tile 大小的整数倍，因此边界必须用 mask 正确处理。不得修改输入 tensor，
 也不得依赖固定的 $B,H,L,T,D$ 才能得到正确结果。
 
 如果你希望探索 causal attention 或 GQA，请在报告中作为额外实验单独说明，并保证
 提交的默认函数仍然遵守上述接口。
 
-\section{作业要求}
+我们推荐按照以下顺序完成作业：
 
 \begin{enumerate}[leftmargin=2.5em]
   \item 实现 prefill kernel，并通过适配层返回正确的 $[B,H,L,D]$ 输出。
   \item 实现 decode kernel，正确读取分离的 KV cache，并通过适配层返回输出。
-  \item 为两个阶段分别做至少一轮有依据的优化。优化不限定为 FlashAttention，
-        也不要求一定使用 online softmax；只实现其中一个阶段会失去另一个阶段的
-        kernel 分数。
+  \item 为两个阶段分别做至少一轮有依据的优化（不做优化只能获得基础正确性分数）。优化不限定为 FlashAttention，也不要求一定使用 online softmax；应根据 profiling 结果选择优化方向。
   \item 提交一份实验报告，解释算法、优化决策、正确性结果和性能数据。
 \end{enumerate}
 
-你可以选择一种实现路径完成两个阶段，也可以组合不同路径进行实验。直接使用
-PyTorch 的现成 attention 算子、FlashAttention、xFormers、FlashInfer 或其他预编译
-attention 库作为最终实现不计入 kernel 分数；它们可以作为参考基线，但必须在报告
-和 \texttt{HONOR-CODE.md} 中明确说明。
+作业评测会使用浮点数进行验证。若使用数学等价但数值不同的算法，可适当放宽精度要求，并在报告中注明。参考实现可以使用 \texttt{ops/base/impl.py} 和
+\texttt{torch.nn.functional.scaled_dot_product_attention}\cite{pytorchsdpa} 交叉检查。
 
-\section{可选的优化方向}
+
+使用课堂提及的 nsys、ncu 等工具进行性能分析，并据此优化代码。报告中需包含 TFLOPS、内存带宽利用率等性能指标，并比较基线版本与优化版本。
+
+\subsubsection{运行方法}
+
+* Cuda：需要使用torch extension来将cuda算子编译成对应的python库，从而进一步在python框架的评测代码中调用，在/ops/cuda/kernels目录下，运行python setup.py install来安装你完成的算子即可，在外部运行时python main.py --stage [prefill/decode] --backends cuda 测试查看性能。
+参考的编译运行指令如下：\begin{verbatim}
+cd ops/cuda/kernels
+TORCH_CUDA_ARCH_LIST=8.9 python setup.py build_ext --inplace
+cd ../..
+python main.py --stage prefill --backends cuda
+\end{verbatim}
+
+课程的 RTX 4090 对应 compute capability 8.9。其他 GPU 应设置相应的
+\texttt{TORCH\_CUDA\_ARCH\_LIST}；不要把某一台机器的架构值硬编码到提交中。
+
+* Triton：在/ops/triton/kernels目录下，完成对应算子的实现即可，在运行时选择python main.py --stage [prefill/decode] --backends triton 测试查看性能。
+
+* 九齿：在/ops/ninetoothed/kernels目录下，完成对应算子的实现即可，在运行时选择python main.py --stage [prefill/decode] --backends ninetoothed 测试查看性能。
+
+\subsection{作业评分}
+
+\subsubsection{Attention算子优化80\%（prefill阶段和decode阶段的算子实现各占40\%）}
+使用上述三种任一语言实现算子满足基本正确性要求以后，即可获得对应模块70\%的性能分。剩余30\%的分数将对所有提交同学的性能进行排名以后，结合评估代码质量和可读性给出，注意三种语言实现将\textbf{统一排名}。注意由于涉及到自动调优，要求程序单测例的\textbf{自动调优时间不得超过15min}，如果超过时限本测例不得分。
+
+\subsubsection{性能分析报告20\%}
+1. 报告需要详细描述Attention算子采取的优化手段，以及在代码中对应的部分。并且能够通过使用性能工具或者性能模型解释目前取得的性能结果。
+2. 进一步讨论分析可能出现的复杂情形，对于一些没有取得性能提升的优化行为，如果能够解释其原理并进行分析，可以酌情加分。
+\subsection{作业提示}
+优先确保正确性，并消除冗余计算，例如避免不必要的转置或同步操作。
+
+可参考其他开源仓库中的Flash Attention实现，但须在HONOR-CODE.md文件中注明来源，以及和同学讨论的情况。具体要求参考\url{https://lab.cs.tsinghua.edu.cn/rust/plagiarism/}。
+
+优化矩阵乘法模块，例如采用共享内存tiling、warp级优化，或参考CUTLASS库的思路（但不可直接使用）。prefill阶段和decode阶段瓶颈不同，针对不同的计算通信比采用不同的优化策略。
 
 下面的内容是建议，不是额外的功能清单。先把接口和边界处理做好，再根据 profiling
 结果决定是否采用其中的思路。
 
 \subsection{Online softmax}
 
-如果你想尝试 FlashAttention 风格的实现，可以沿着 Key 的 tile 逐块更新 softmax，
-避免保存完整的 $L\times S$ 分数矩阵。对每个 Query 行维护最大值 $m$、归一化因子
-$\ell$ 和部分输出 $o$。读入新的分数 tile 后，可使用如下递推：
+为了说明 FlashAttention 一类方法为什么能够减少显存读写，先看直接实现
+scaled dot-product attention 时会发生什么。假设 Query 的长度为 $L$，Key 和 Value
+的长度为 $S$，head dimension 为 $D$。计算
+\begin{equation}
+  Z = QK^\mathsf{T}
+\end{equation}
+时，会得到一个形状为 $[L,S]$ 的分数矩阵 $Z$：第 $i$ 行第 $j$ 列表示第 $i$ 个
+Query 与第 $j$ 个 Key 的缩放点积。接着对 $Z$ 的每一行做 Softmax，得到同样为
+$[L,S]$ 的概率矩阵 $P$，最后计算 $O=PV$。因此，直接实现至少需要把 $Z$ 或 $P$
+写入显存，并在后续计算中再次读出；当 $L$ 和 $S$ 较大时，这个中间矩阵的空间和
+访存开销都很高。
+
+Online softmax 的思路是把 Key 和 Value 按列切成 tile。每次只计算一小块分数
+\(Z_{i,j}=Q_iK_j^\mathsf{T}\)，不把完整的 $L\times S$ 矩阵写回显存。为了让分块
+计算与完整 Softmax 的结果一致，对每个 Query 行维护三个量：当前已经处理部分的
+最大分数 $m$、经过缩放的指数和 $\ell$，以及已经归一化的部分输出 $o$。开始处理
+一行时初始化为
+\begin{equation}
+  m=-\infty,\qquad \ell=0,\qquad o=0.
+\end{equation}
+
+对于一个新的 Key tile，先将越界位置的分数设为 $-\infty$，然后令
+$m_{\rm tile}$ 为该 tile 每一行的最大值，并计算新的行最大值
+$m_{\rm new}=\max(m_{\rm old},m_{\rm tile})$。在新的最大值下，旧 tile 和新 tile
+的指数项分别需要乘上不同的缩放因子：
 \begin{align}
-  m_{\rm new} &= \max(m_{\rm old},\max_j s_j),\\
-  \ell_{\rm new} &= \ell_{\rm old}e^{m_{\rm old}-m_{\rm new}}
-      +\sum_j e^{s_j-m_{\rm new}},\\
-  o_{\rm new} &= \frac{o_{\rm old}\ell_{\rm old}e^{m_{\rm old}-m_{\rm new}}
-      +\sum_j e^{s_j-m_{\rm new}}v_j}{\ell_{\rm new}}.
+  \alpha &= e^{m_{\rm old}-m_{\rm new}},
+  &p_j &= e^{z_j-m_{\rm new}}.
 \end{align}
-初始状态应能处理边界 tile，最终输出不能包含 NaN 或 Inf。直接 materialize 分数
-矩阵也可以作为第一版实现；报告中请比较两种方法的代价和收益。
+其中 $z_j$ 是当前 tile 中某一行的分数。于是可以更新指数和与输出：
+\begin{align}
+  \ell_{\rm new} &= \alpha\ell_{\rm old}+\sum_j p_j,\\
+  o_{\rm new} &=
+  \frac{\alpha\ell_{\rm old}o_{\rm old}+\sum_j p_jv_j}
+       {\ell_{\rm new}}.
+\end{align}
+完成所有 Key tile 后，$o$ 就是完整 Softmax 后的 Attention 输出。这个递推的关键
+是始终减去当前行的最大值，因此不会直接计算很大的 $e^{z_j}$，数值上比先求完整
+分数矩阵再做 Softmax 更稳定。实现时需要特别注意：如果你保存的是未归一化的
+输出累加量，更新公式会略有不同；上面的公式假设 $o_{\rm old}$ 已经除以
+旧的 $\ell_{\rm old}$。
+
+Prefill 中通常同时处理多行 Query 和多个 Key tile；decode 中 Query 长度为 1，
+但仍然可以沿着长度为 $T+1$ 的 KV cache 分块处理。这样 decode kernel 不需要先
+拼接 $K_{\rm past}$ 和新 $K$，也不需要保存长度为 $T+1$ 的分数矩阵。Online softmax
+只是可选的优化方向；直接保存分数矩阵的实现同样可以作为正确的起点，报告中应
+说明两种实现的空间、访存和性能差异。
 
 \subsection{Prefill 优化方向}
 
-Prefill 的 $QK^\mathsf{T}$ 和 $PV$ 都具有较大的二维工作量。可以从以下问题开始
+Prefill 的 $QK^\mathsf{T}$ 和 $PV$ 都具有比较高的计算密度。可以从以下问题开始
 分析：
 \begin{itemize}[leftmargin=2.5em]
   \item 如何让 Q、K、V 的读取合并，并让重复使用的数据停留在 SRAM 或寄存器中；
   \item $BLOCK\_SIZE\_M$、$BLOCK\_SIZE\_N$、warp 数和 pipeline stages 如何影响
-        occupancy、寄存器压力和内存事务；
+        occupancy、寄存器压力和内存管理；
   \item 是否值得避免 $L\times S$ 中间张量，以及这样做对寄存器和访存的影响；
   \item 如何处理 $L$、$D$ 不是 tile 大小整数倍的边界。
 \end{itemize}
@@ -199,141 +245,27 @@ Decode 的 Query 长度固定为 1，计算常常受 KV cache 读取和并行度
 这些只是分析入口，不要求所有人使用同一种算法。报告应结合实际测量说明你的
 选择，不需要为了使用某个术语而强行改写算法。
 
-\section{环境、运行和调试}
+\textbf{如遇问题，请及时与教师和助教沟通}。建议在实现前先画出计算流程图，并从小规模输入开始逐步调试。
 
-在课程提供的容器中安装依赖：
-\begin{verbatim}
-pip install -r requirements.txt
-\end{verbatim}
+\section{提示和参考资料}
 
-当前依赖固定为 Torch 2.13.0 和 NineToothed 0.26.0。建议使用 CUDA 13.0 的
-PyTorch wheel；如果课程容器已经提供匹配的 Torch/CUDA，则以容器为准。运行时先
-确认：
-\begin{verbatim}
-python -c "import torch; print(torch.__version__, torch.cuda.is_available())"
-\end{verbatim}
+注意力的基本定义可以参考原始 Transformer 论文\cite{vaswani2017attention}。FlashAttention 和
+FlashAttention-2 介绍了分块计算、I/O 感知和 online softmax 等优化思路
+\cite{dao2022flashattention,dao2023flashattention2}，但不要求照搬其中的实现。
 
-\subsection{正确性和本地 benchmark}
-
-下面的命令分别运行两个阶段的参考基线。\texttt{torch} 只用于检查环境和建立
-基线：
-\begin{verbatim}
-python main.py --stage prefill --backends torch
-python main.py --stage decode  --backends torch
-\end{verbatim}
-
-完成 Triton 或 NineToothed 后，可运行：
-\begin{verbatim}
-python main.py --stage prefill --backends torch triton
-python main.py --stage decode  --backends torch triton
-python main.py --stage prefill --backends torch ninetoothed
-python main.py --stage decode  --backends torch ninetoothed
-\end{verbatim}
-
-这些命令用于快速发现 shape、边界和数值错误。正式评分会使用多组隐藏输入，
-不应只针对仓库中默认的一个长度或一个 tile 配置优化。首次运行 Triton 或
-NineToothed 时会包含编译和 autotune 开销；报告中的稳态性能必须在预热之后测量。
-
-\subsection{CUDA 路径（可选）}
-
-如果选择 CUDA C++，进入 \texttt{ops/cuda/kernels} 编译扩展：
-\begin{verbatim}
-cd ops/cuda/kernels
-TORCH_CUDA_ARCH_LIST=8.9 python setup.py build_ext --inplace
-cd ../..
-python main.py --stage prefill --backends cuda
-\end{verbatim}
-
-课程的 RTX 4090 对应 compute capability 8.9。其他 GPU 应设置相应的
-\texttt{TORCH\_CUDA\_ARCH\_LIST}；不要把某一台机器的架构值硬编码到提交中。
-Triton、NineToothed 和 Torch 路径不需要编译这个扩展，框架会在未安装扩展时给出
-明确提示。
-
-\section{正确性要求}
-
-正确性检查应至少覆盖以下情况：
-\begin{itemize}[leftmargin=2.5em]
-  \item $B\in\{1,2,4\}$、$H\in\{1,8,32\}$、$D\in\{32,64,128\}$；
-  \item prefill 的 $L$ 和 decode 的 $T$ 同时覆盖很短、非 tile 整数倍和较长输入；
-  \item $\texttt{scale=None}$ 以及显式传入一个 scale；
-  \item float16 输入下的有限值、相对误差和绝对误差；
-  \item 多次运行结果稳定，且不会修改输入或产生越界访问。
-\end{itemize}
-
-参考实现可以使用 \texttt{ops/base/impl.py} 和
-\texttt{torch.nn.functional.scaled_dot_product_attention}\cite{pytorchsdpa} 交叉检查。由于不同
-实现的归约顺序不同，不能要求逐元素 bitwise 相等。报告必须给出测试 shape、最大
-绝对误差、最大相对误差和采用的容差，并解释任何失败样例。
-
-\section{性能测量和报告}
-
-报告至少包含以下内容：
-\begin{enumerate}[leftmargin=2.5em]
-  \item kernel 的算法流程和线程/块映射图；
-  \item online softmax、边界 mask、累加精度和 KV cache 读取方式；
-  \item 至少三组 prefill 和三组 decode 的稳态延迟，包含输入 shape、dtype、GPU、
-        warmup 次数和重复次数；
-  \item 与 Torch 参考基线的延迟、加速比，以及能提供时的 TFLOP/s 和有效内存带宽；
-  \item 使用 nsys、ncu 或等价工具得到的证据，例如 kernel 时间线、occupancy、
-        DRAM throughput、寄存器或 shared-memory 使用量；
-  \item 一个失败或收益不明显的优化尝试，并说明原因；
-  \item 其他同学可以复现实验的完整命令。
-\end{enumerate}
-
-对于 batch size $B$、head 数 $H$、Query 长度 $L$、Key 长度 $S$ 和 head dimension
-$D$，可用约 $4BH LSD$ 次浮点运算粗略估算 attention 的 FLOPs（一次 $QK^\mathsf{T}$
-和一次 $PV$）。若测得 kernel 时间为 $t$ 毫秒，则
-\begin{equation}
-  \operatorname{TFLOP/s}\approx\frac{4BH LSD}{t\times10^9}.
-\end{equation}
-该估算用于横向比较，不替代对实际指令和访存的分析。编译、首次 autotune、模型
-加载和 Python 打印时间不得混入稳态 kernel 延迟。
-
-\section{评分标准}
-
-总分为 100 分：
+Triton 的官方文档和教程适合用来查阅 kernel、tile、mask 和 autotune 的接口
+\cite{triton2024}；NineToothed 的文档和示例仓库中也有对应的 Triton 与 NineToothed
+代码可供参考\cite{ninetoothed2026}：
 \begin{center}
-\begin{tabular}{p{0.48\textwidth} c p{0.34\textwidth}}
-\toprule
-部分 & 分值 & 评分要点 \\
-\midrule
-Prefill kernel & 40 & 正确性/API 28 分；性能、代码质量和分析 12 分 \\
-Decode kernel & 40 & 正确性/API 28 分；性能、代码质量和分析 12 分 \\
-实验报告 & 20 & 算法说明、测量方法、性能证据和局限性 \\
-\bottomrule
-\end{tabular}
+\url{https://github.com/InfiniTensor/ninetoothed-examples/}
 \end{center}
 
-每个阶段的性能分在通过正确性门槛后才有效；只返回固定值、调用现成 attention
-库、依赖特定测试输入或在边界输入上越界的实现不能获得该阶段的正确性分。性能分
-在所有通过正确性门槛的提交之间统一比较，不因使用 CUDA、Triton 或 NineToothed
-而预先设置不同的排名标准。自动调优必须在每个测试 case 的 15 分钟限制内结束；
-超时的 case 不计该 case 的性能分。
+PyTorch 的 scaled dot-product attention 文档可以用来核对函数语义和输入输出形状
+\cite{pytorchsdpa}。参考公开代码或与同学讨论时，请在 \texttt{HONOR-CODE.md} 中
+注明来源和具体使用方式；不得直接将现成的 Attention kernel 作为本作业结果。
 
-\section{提交内容和学术规范}
 
-提交目录命名为“学号\_Attention\_姓名”，例如
-\texttt{2025310000\_Attention\_张三}。目录至少包含：
-\begin{itemize}[leftmargin=2.5em]
-  \item 修改后的 kernel、适配层和必要的配置文件；
-  \item 一份 PDF 或 LaTeX 源码形式的性能分析报告；
-  \item \texttt{HONOR-CODE.md}，列出使用过的公开代码、文档、生成式工具和讨论过
-        的同学，并说明它们如何影响提交；
-  \item 一份简短的复现说明，包括环境、编译命令、测试命令和已知限制。
-\end{itemize}
-
-禁止提交编译产物、模型权重、与作业无关的大文件或依赖本机绝对路径的脚本。允许
-讨论思路和阅读公开资料，但实现、调参和报告必须独立完成。抄袭、隐瞒外部代码
-来源或伪造性能数据将按课程学术规范处理。具体要求见
-\href{https://lab.cs.tsinghua.edu.cn/rust/plagiarism/}{课程学术规范页面}。
-
-\section{参考资料}
-
-建议先阅读注意力的原始定义，再阅读 FlashAttention 和 FlashAttention-2 对分块
-计算、I/O 感知和并行划分的讨论。Triton 和 NineToothed 的官方文档可用于查阅
-语言语义和编程接口；它们不是可以直接复制到提交中的答案。
-
-\bibliographystyle{plain}
+\bibliographystyle{plain}  % Choose your preferred bibliography style
 \bibliography{ref}
 
 \end{document}
