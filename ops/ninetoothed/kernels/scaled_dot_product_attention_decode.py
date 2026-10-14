@@ -1,25 +1,14 @@
-import ninetoothed
-import ninetoothed.language as ntl
-from ninetoothed import Tensor, block_size
+"""Decode reference entry point.
 
-BLOCK_SIZE_M = block_size()
-BLOCK_SIZE_N = block_size()
+The wrapper in :mod:`ops.ninetoothed.torch` concatenates the KV cache and
+launches the prefill kernel. This module keeps the original import path and
+leaves room for a cache-aware implementation as an optimization exercise.
+"""
 
+from .scaled_dot_product_attention_prefill import (
+    application,
+    arrangement,
+    kernel,
+)
 
-def arrangement(
-    q, k, v, past_k, past_v, scale, o, BLOCK_SIZE_M=BLOCK_SIZE_M, BLOCK_SIZE_N=BLOCK_SIZE_N
-):
-    #TODO: 实现kernel
-    assert False, "This function is not implemented yet."
-    
-
-def application(q, k, v, past_k, past_v, scale, o):
-    #TODO: 实现kernel
-    assert False, "This function is not implemented yet."
-    
-# You can modify the following lines
-# shape_options = (None, None, None, {"constexpr": True, "upper_bound": 128})
-# q, k, v, past_k, past_v, o = (Tensor(4, shape_options=shape_options) for _ in range(6))
-# tensors = (q, k, v, past_k, past_v, Tensor(0), o)
-
-# kernel = ninetoothed.make(arrangement, application, tensors)
+__all__ = ["arrangement", "application", "kernel"]
